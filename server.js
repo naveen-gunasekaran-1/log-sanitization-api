@@ -1,20 +1,41 @@
+require('dotenv').config();
 const express = require('express');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-
+const crypto = require('crypto');
+const Groq = require('groq-sdk');
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Groq API Configuration
+if (!process.env.GROQ_API_KEY) {
+    console.error('[ERROR] GROQ_API_KEY not found in environment variables!');
+    console.log('[INFO] Get your free API key at: https://console.groq.com/keys');
+    process.exit(1);
+}
+
+const groq = new Groq({
+    apiKey: process.env.GROQ_API_KEY
+});
+
+// In-memory cache for AI analysis (use Redis in production)
+const analysisCache = new Map();
 
 // Configure multer for file uploads
 const storage = multer.memoryStorage();
 const upload = multer({
     storage: storage,
     fileFilter: (req, file, cb) => {
-        if (file.mimetype === 'text/plain' || file.originalname.endsWith('.txt')) {
+        const allowedExtensions = ['.txt', '.log', '.json'];
+        const hasValidExtension = allowedExtensions.some(ext => file.originalname.endsWith(ext));
+        const allowedMimeTypes = ['text/plain', 'application/json', 'text/x-log'];
+        const hasValidMimeType = allowedMimeTypes.includes(file.mimetype) || file.mimetype === '';
+        
+        if (hasValidExtension || hasValidMimeType) {
             cb(null, true);
         } else {
-            cb(new Error('Only .txt files are allowed'), false);
+            cb(new Error('Only .txt, .log, and .json files are allowed'), false);
         }
     },
     limits: {
@@ -45,6 +66,7 @@ const PATTERNS = {
     // User identifiers
     username: /(?:user(?:name)?|login|account|uid)[\s:=]+([a-zA-Z0-9_\-\.]{3,20})/gi,
     atUsername: /@[a-zA-Z0-9_]{3,15}\b/g,
+    jsonUsername: /"username"\s*:\s*"([a-zA-Z0-9_\-\.]{3,30})"/gi,
     
     // Timestamps
     isoTimestamp: /\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d{3})?(?:Z|[+-]\d{2}:\d{2})?/g,
@@ -55,8 +77,9 @@ const PATTERNS = {
     creditCard: /\b(?:\d{4}[\s\-]?){3}\d{4}\b/g,
     ssn: /\b\d{3}-\d{2}-\d{4}\b/g,
     
-    // Phone numbers
-    phone: /(?:\+\d{1,3}[\s\-]?)?\(?(\d{3})\)?[\s\-]?(\d{3})[\s\-]?(\d{4})/g,
+    // Phone numbers (supports multiple international formats)
+    phone: /\+?\d{1,4}[\s\-]?\(?\d{1,4}\)?[\s\-]?\d{1,4}[\s\-]?\d{1,4}[\s\-]?\d{0,9}/g,
+    jsonPhone: /"phone"\s*:\s*"([+\d\s\-\(\)]+)"/gi,
     
     // API & Security
     api: /[A-Za-z0-9]{8}-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}-[A-Za-z0-9]{12}/g,
@@ -202,8 +225,12 @@ function processText(text) {
     redactedText = redactedText.replace(PATTERNS.unixTimestamp, '[REDACTED_UNIX_TIME]');
     
     // 12. User identifiers
+    redactedText = redactedText.replace(PATTERNS.jsonUsername, '"username": "[REDACTED_USERNAME]"');
     redactedText = redactedText.replace(PATTERNS.username, '$1 [REDACTED_USERNAME]');
     redactedText = redactedText.replace(PATTERNS.atUsername, '[REDACTED_USERNAME]');
+    
+    // 12b. JSON phone numbers (before general phone pattern)
+    redactedText = redactedText.replace(PATTERNS.jsonPhone, '"phone": "[REDACTED_PHONE]"');
     
     // 13. Process/Thread IDs
     redactedText = redactedText.replace(PATTERNS.pid, '$1 [REDACTED_PID]');
@@ -260,13 +287,162 @@ function processText(text) {
 }
 
 // ==========================================
-// API ROUTES
+// HELPER FUNCTIONS
 // ==========================================
 
-// Health check endpoint
-app.get('/api/health', (req, res) => {
-    res.json({ status: 'ok', message: 'Log Redaction Service is running' });
-});
+/**
+ * Extract error lines from redacted text
+ */
+function extractErrorLogs(text) {
+    const lines = text.split("\n");
+
+    // Generic keywords widely used across logs
+    const errorStartRegex = /\b(error|exception|fail|failed|critical|fatal|panic|traceback|denied|refused|timeout|unavailable|rejected|invalid)\b/i;
+
+    const result = [];
+    let currentError = [];
+    let collecting = false;
+
+    for (const line of lines) {
+
+        // Detect start of an error block
+        if (errorStartRegex.test(line)) {
+            // If we were already collecting, save the previous error
+            if (collecting && currentError.length > 0) {
+                result.push(currentError.join("\n").trim());
+                currentError = [];
+            }
+            collecting = true;
+        }
+
+        // Keep collecting lines until a blank separator or next timestamp
+        if (collecting) {
+            currentError.push(line);
+
+            // Multi-line block end conditions
+            if (
+                line.trim() === "" ||                       // blank line ends block  
+                /^\d{4}-\d{2}-\d{2}[ T]/.test(line)         // timestamp indicates new log entry  
+            ) {
+                if (currentError.length > 0) {
+                    result.push(currentError.join("\n").trim());
+                    currentError = [];
+                }
+                collecting = false;
+            }
+        }
+    }
+
+    // Don't forget the last error if we were still collecting
+    if (currentError.length > 0) {
+        result.push(currentError.join("\n").trim());
+    }
+
+    return result.filter(log => log.length > 0);
+}
+
+
+/**
+ * Generate SHA256 hash for caching
+ */
+function generateHash(text) {
+    return crypto.createHash('sha256').update(text).digest('hex');
+}
+
+/**
+ * Analyze a single error using Gemini AI
+ */
+async function analyzeSingleError(errorText) {
+    if (!errorText || errorText.trim().length === 0) {
+        return null;
+    }
+
+    // Check cache first
+    const hash = generateHash(errorText);
+    if (analysisCache.has(hash)) {
+        console.log('[CACHE HIT] Returning cached analysis for error');
+        return { ...analysisCache.get(hash), cached: true };
+    }
+
+    try {
+        const promptText = `Analyze this single error log and provide:
+1. Severity Level (Critical/High/Medium/Low)
+2. Detailed Root Cause
+3. Possible Solutions
+4. Prevention Tips
+
+Error Log:
+${errorText}
+
+Respond ONLY in this exact JSON format:
+{
+  "severity": "Critical|High|Medium|Low",
+  "cause": "Brief explanation of the root cause",
+  "solutions": ["solution 1", "solution 2", "solution 3"],
+  "prevention": "Prevention tips"
+}`;
+
+        const completion = await groq.chat.completions.create({
+            model: "llama-3.3-70b-versatile",
+            messages: [
+                {
+                    role: "system",
+                    content: "You are an expert log analyzer. Analyze the error log and provide severity, root cause, solutions, and prevention tips in JSON format. Be specific and actionable."
+                },
+                {
+                    role: "user",
+                    content: promptText
+                }
+            ],
+            temperature: 0.7,
+            max_tokens: 800
+        });
+
+        const text = completion.choices[0].message.content;
+        
+        // Parse JSON response - handle markdown code blocks and extra text
+        let jsonText = text.trim();
+        
+        // Remove markdown code fences if present
+        jsonText = jsonText.replace(/```json\s*/g, '').replace(/```\s*/g, '');
+        
+        // Extract JSON object (first complete object found)
+        const jsonMatch = jsonText.match(/\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}/);
+        if (jsonMatch) {
+            try {
+                const analysis = JSON.parse(jsonMatch[0]);
+                analysis.cached = false;
+                analysis.errorLog = errorText;
+                
+                // Store in cache
+                analysisCache.set(hash, analysis);
+                console.log('[CACHE MISS] Analysis stored in cache');
+                
+                return analysis;
+            } catch (parseError) {
+                console.error('[ERROR] JSON parse error:', parseError.message);
+                console.error('[DEBUG] Extracted JSON:', jsonMatch[0]);
+                throw new Error('Invalid JSON format in AI response');
+            }
+        }
+        
+        console.error('[DEBUG] AI Response:', text);
+        throw new Error('Invalid response format from Groq AI');
+    } catch (error) {
+        console.error('[ERROR] Groq API error:', error);
+        return {
+            severity: 'Unknown',
+            cause: 'Failed to analyze errors',
+            solutions: ['Check API key', 'Verify error log format'],
+            prevention: 'Ensure proper logging configuration',
+            error: error.message
+        };
+    }
+}
+
+// ==========================================
+// API ROUTES
+// ==========================================
 
 // Upload and redact file
 app.post('/api/redact', upload.single('file'), (req, res) => {
@@ -288,12 +464,17 @@ app.post('/api/redact', upload.single('file'), (req, res) => {
             totalRedactions: result.counts.TOTAL
         });
         
+        // Extract error logs from redacted text
+        const errorLogs = extractErrorLogs(result.redacted);
+        console.log(errorLogs);
+        
         res.json({
             success: true,
             filename: req.file.originalname,
             original: result.original,
             redacted: result.redacted,
-            statistics: result.counts
+            hasErrors: errorLogs.length > 0,
+            errorCount: errorLogs.split('\n').filter(l => l.trim()).length
         });
         
     } catch (error) {
@@ -318,14 +499,82 @@ app.post('/api/redact-text', (req, res) => {
         
         res.json({
             success: true,
-            redacted: result.redacted,
-            statistics: result.counts
+            redacted: result.redacted
         });
         
     } catch (error) {
         console.error('[ERROR]', error);
         res.status(500).json({ 
             error: 'Failed to redact text',
+            message: error.message 
+        });
+    }
+});
+
+// Analyze errors with Gemini AI
+app.post('/api/analyze-errors', async (req, res) => {
+    try {
+        const { redactedText } = req.body;
+        
+        if (!redactedText) {
+            return res.status(400).json({ error: 'No redacted text provided' });
+        }
+        
+        // Extract error logs as an array
+        const errorLogsArray = extractErrorLogs(redactedText);
+        
+        if (!errorLogsArray || errorLogsArray.length === 0) {
+            return res.json({
+                success: true,
+                hasErrors: false,
+                message: 'No errors found in the logs'
+            });
+        }
+        
+        console.log(`[INFO] Analyzing ${errorLogsArray.length} error(s) with AI...`);
+        
+        // Analyze each error separately
+        const analyses = [];
+        for (let i = 0; i < errorLogsArray.length; i++) {
+            const errorLog = errorLogsArray[i];
+            console.log(`[INFO] Analyzing error ${i + 1}/${errorLogsArray.length}`);
+            
+            try {
+                const analysis = await analyzeSingleError(errorLog);
+                if (analysis) {
+                    analyses.push({
+                        errorNumber: i + 1,
+                        errorLog: errorLog,
+                        analysis: analysis
+                    });
+                }
+            } catch (error) {
+                console.error(`[ERROR] Failed to analyze error ${i + 1}:`, error.message);
+                analyses.push({
+                    errorNumber: i + 1,
+                    errorLog: errorLog,
+                    analysis: {
+                        severity: 'Unknown',
+                        cause: 'Failed to analyze this error',
+                        solutions: ['Retry analysis', 'Check error log format'],
+                        prevention: 'Ensure proper logging format',
+                        error: error.message
+                    }
+                });
+            }
+        }
+        
+        res.json({
+            success: true,
+            hasErrors: true,
+            totalErrors: errorLogsArray.length,
+            analyses: analyses
+        });
+        
+    } catch (error) {
+        console.error('[ERROR] Analysis failed:', error);
+        res.status(500).json({ 
+            error: 'Failed to analyze errors',
             message: error.message 
         });
     }
@@ -346,15 +595,7 @@ app.use((error, req, res, next) => {
 
 // Start server
 app.listen(PORT, () => {
-    console.log(`
-╔════════════════════════════════════════════╗
-║   Log Redaction Service                    ║
-║   Server running on port ${PORT}             ║
-║                                            ║
-║   Frontend: http://localhost:${PORT}        ║
-║   API:      http://localhost:${PORT}/api    ║
-╚════════════════════════════════════════════╝
-    `);
+    console.log('server is running');
 });
 
 module.exports = app;
