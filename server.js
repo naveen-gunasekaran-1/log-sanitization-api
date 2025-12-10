@@ -1,5 +1,6 @@
 require('dotenv').config();
 const express = require('express');
+const cors = require('cors');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
@@ -42,6 +43,13 @@ const upload = multer({
         fileSize: 10 * 1024 * 1024 // 10MB limit
     }
 });
+
+// Enable CORS for all origins (configure for specific origins in production)
+app.use(cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
 
 // Serve static files
 app.use(express.static(__dirname));
@@ -103,7 +111,25 @@ const PATTERNS = {
     bearer: /Bearer\s+[A-Za-z0-9\-_\.]+/g,
     
     // Personal Information
-    name: /(?:first[\s_]?name|last[\s_]?name|full[\s_]?name)[\s:=]+([A-Za-z\s]{2,30})/gi,
+    name: /(?:first[\s_]?name|last[\s_]?name|full[\s_]?name)[\s:=]+([A-Za-z ]{2,30})/gi,
+    jsonFirstName: /"firstName"\s*:\s*"([A-Za-z ]{2,30})"/gi,
+    jsonLastName: /"lastName"\s*:\s*"([A-Za-z ]{2,30})"/gi,
+    jsonCardholderName: /"cardholderName"\s*:\s*"([A-Za-z .]{2,50})"/gi,
+    nameAfterID: /\bID:\s*([A-Z][A-Za-z]+)\b/g,
+    // Standalone capitalized names (2-4 words, each starting with capital)
+    capitalizedName: /\b[A-Z][a-z]{2,15}(?: [A-Z]\.?)?(?: [A-Z][a-z]{2,15}){0,2}\b/g,
+    // All-caps names (like SANTHAOSH, SANTHOSH, etc.) - 6+ letters to avoid common words
+    allCapsName: /\b[A-Z]{6,20}\b/g,
+    // Email in any JSON value
+    jsonEmail: /"email"\s*:\s*"([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})"/gi,
+    // Phone in any JSON value
+    jsonPhoneNumber: /"phoneNumber"\s*:\s*"([+\d \-()]+)"/gi,
+    // City names in JSON
+    jsonCity: /"city"\s*:\s*"([A-Za-z ]{2,30})"/gi,
+    // State in JSON
+    jsonState: /"state"\s*:\s*"([A-Z]{2})"/gi,
+    // Street in JSON
+    jsonStreet: /"street"\s*:\s*"([^"]{5,100})"/gi,
     address: /\d+\s+[A-Za-z\s]+(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Lane|Ln|Drive|Dr|Court|Ct|Circle|Cir)(?:\s+(?:Apt|Suite|Unit|#)\s*[A-Za-z0-9]+)?/gi,
     
     // Log-specific
@@ -168,8 +194,13 @@ function processText(text) {
         privateKeys: countMatches(text, PATTERNS.privateKey),
         dbUris: countMatches(text, PATTERNS.mongoUri) + countMatches(text, PATTERNS.sqlUri),
         sessions: countMatches(text, PATTERNS.sessionId) + countMatches(text, PATTERNS.bearer),
-        names: countMatches(text, PATTERNS.name),
-        addresses: countMatches(text, PATTERNS.address),
+        names: countMatches(text, PATTERNS.name) + countMatches(text, PATTERNS.jsonFirstName) + 
+               countMatches(text, PATTERNS.jsonLastName) + countMatches(text, PATTERNS.jsonCardholderName) +
+               countMatches(text, PATTERNS.nameAfterID) + countMatches(text, PATTERNS.capitalizedName) +
+               countMatches(text, PATTERNS.allCapsName),
+        addresses: countMatches(text, PATTERNS.address) + countMatches(text, PATTERNS.jsonStreet),
+        cities: countMatches(text, PATTERNS.jsonCity),
+        states: countMatches(text, PATTERNS.jsonState),
         pids: countMatches(text, PATTERNS.pid),
         threads: countMatches(text, PATTERNS.threadId)
     };
@@ -206,7 +237,10 @@ function processText(text) {
     redactedText = redactedText.replace(PATTERNS.creditCard, '[REDACTED_CREDIT_CARD]');
     redactedText = redactedText.replace(PATTERNS.ssn, '[REDACTED_SSN]');
     
-    // 8. Contact information
+    // 8. Contact information (JSON specific patterns first)
+    redactedText = redactedText.replace(PATTERNS.jsonEmail, '"email": "[REDACTED_EMAIL]"');
+    redactedText = redactedText.replace(PATTERNS.jsonPhoneNumber, '"phoneNumber": "[REDACTED_PHONE]"');
+    redactedText = redactedText.replace(PATTERNS.jsonPhone, '"phone": "[REDACTED_PHONE]"');
     redactedText = redactedText.replace(PATTERNS.phone, '[REDACTED_PHONE]');
     redactedText = redactedText.replace(PATTERNS.email, '[REDACTED_EMAIL]');
     
@@ -215,9 +249,66 @@ function processText(text) {
     redactedText = redactedText.replace(PATTERNS.ipv4, '[REDACTED_IPv4]');
     redactedText = redactedText.replace(PATTERNS.mac, '[REDACTED_MAC_ADDRESS]');
     
-    // 10. Personal information
+    // 10. Personal information (JSON and specific patterns first)
+    redactedText = redactedText.replace(PATTERNS.jsonFirstName, '"firstName": "[REDACTED_NAME]"');
+    redactedText = redactedText.replace(PATTERNS.jsonLastName, '"lastName": "[REDACTED_NAME]"');
+    redactedText = redactedText.replace(PATTERNS.jsonCardholderName, '"cardholderName": "[REDACTED_NAME]"');
+    redactedText = redactedText.replace(PATTERNS.jsonCity, '"city": "[REDACTED_CITY]"');
+    redactedText = redactedText.replace(PATTERNS.jsonState, '"state": "[REDACTED_STATE]"');
+    redactedText = redactedText.replace(PATTERNS.jsonStreet, '"street": "[REDACTED_STREET]"');
+    redactedText = redactedText.replace(PATTERNS.nameAfterID, 'ID: [REDACTED_NAME]');
     redactedText = redactedText.replace(PATTERNS.name, '$1 [REDACTED_NAME]');
     redactedText = redactedText.replace(PATTERNS.address, '[REDACTED_ADDRESS]');
+    // Redact all-caps names (but exclude common log/system keywords and English words)
+    redactedText = redactedText.replace(PATTERNS.allCapsName, function(match) {
+        // Exclude common technical keywords, log levels, HTTP methods, common words, city names
+        const excludeWords = ['ERROR', 'INFO', 'WARN', 'DEBUG', 'FATAL', 'TRACE', 'SUCCESS', 'FAILED',
+                             'TRUE', 'FALSE', 'NULL', 'NONE', 'POST', 'PATCH', 'DELETE', 'HEAD',
+                             'OPTIONS', 'CONNECT', 'HTTP', 'HTTPS', 'JSON', 'TOTAL', 'USER', 'ADMIN',
+                             'ROOT', 'GUEST', 'TEST', 'PROD', 'STAGING', 'EMAIL', 'PHONE', 'ADDRESS',
+                             'PASSWORD', 'USERNAME', 'TOKEN', 'BEARER', 'PATH', 'FILE', 'DATA',
+                             'SERVER', 'CLIENT', 'REQUEST', 'RESPONSE', 'SESSION', 'COOKIE', 'HEADER',
+                             'BODY', 'STATUS', 'METHOD', 'CONTENT', 'TYPE', 'LENGTH', 'ENCODING',
+                             'CHARSET', 'LANGUAGE', 'LOCATION', 'ORIGIN', 'REFERER', 'ACCEPT',
+                             'AUTHORIZATION', 'CACHE', 'CONTROL', 'PRAGMA', 'EXPIRES', 'MODIFIED',
+                             'ETAG', 'RANGE', 'CONNECTION', 'UPGRADE', 'TRANSFER', 'ENCODING',
+                             // Common English words (keep these visible)
+                             'ABOUT', 'ABOVE', 'ACROSS', 'AFTER', 'AGAINST', 'ALONG', 'AMONG', 'AROUND',
+                             'BEFORE', 'BEHIND', 'BELOW', 'BENEATH', 'BESIDE', 'BETWEEN', 'BEYOND',
+                             'DURING', 'EXCEPT', 'INSIDE', 'OUTSIDE', 'THROUGH', 'TOWARD', 'UNDER',
+                             'WITHIN', 'WITHOUT', 'ALWAYS', 'NEVER', 'OFTEN', 'SOMETIMES', 'USUALLY',
+                             'ALREADY', 'ALMOST', 'ENOUGH', 'REALLY', 'REALLY', 'SHOULD', 'WOULD',
+                             'COULD', 'MIGHT', 'PLEASE', 'THANKS', 'WELCOME', 'HELLO', 'GOODBYE',
+                             // Common city names to keep
+                             'CHENNAI', 'MUMBAI', 'DELHI', 'BANGALORE', 'KOLKATA', 'HYDERABAD',
+                             'CHICAGO', 'LONDON', 'PARIS', 'TOKYO', 'SYDNEY', 'DUBAI', 'SINGAPORE',
+                             'TORONTO', 'BOSTON', 'SEATTLE', 'AUSTIN', 'DALLAS', 'DENVER', 'MIAMI',
+                             'ATLANTA', 'PHOENIX', 'PORTLAND'];
+        if (excludeWords.includes(match)) {
+            return match;
+        }
+        return '[REDACTED_NAME]';
+    });
+    // Aggressive: redact standalone capitalized names (but avoid common words)
+    redactedText = redactedText.replace(PATTERNS.capitalizedName, function(match) {
+        // Exclude common log keywords and known safe words
+        const excludeWords = ['ERROR', 'INFO', 'WARN', 'DEBUG', 'FATAL', 'TRACE', 'SUCCESS', 'FAILED', 
+                             'GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'UserService', 'PaymentProcessor',
+                             'FileHandler', 'Scheduler', 'MainApplication', 'AuthService', 'Customer',
+                             'Database', 'Request', 'Response', 'Exception', 'Application', 'System',
+                             'Thread', 'Process', 'Bearer', 'Token', 'Please', 'USA', 'Task', 'Invalid',
+                             'Unhandled', 'Failed', 'File', 'Payment', 'Retrying', 'Cust', 'City', 'State',
+                             'Country', 'Street', 'Avenue', 'Chicago', 'Illinois'];
+        if (excludeWords.some(word => match.includes(word))) {
+            return match;
+        }
+        // If it looks like a person's name (2-3 capitalized words), redact it
+        const words = match.trim().split(/\s+/);
+        if (words.length >= 2 && words.length <= 4) {
+            return '[REDACTED_NAME]';
+        }
+        return match;
+    });
     
     // 11. Timestamps
     redactedText = redactedText.replace(PATTERNS.isoTimestamp, '[REDACTED_TIMESTAMP]');
@@ -228,9 +319,6 @@ function processText(text) {
     redactedText = redactedText.replace(PATTERNS.jsonUsername, '"username": "[REDACTED_USERNAME]"');
     redactedText = redactedText.replace(PATTERNS.username, '$1 [REDACTED_USERNAME]');
     redactedText = redactedText.replace(PATTERNS.atUsername, '[REDACTED_USERNAME]');
-    
-    // 12b. JSON phone numbers (before general phone pattern)
-    redactedText = redactedText.replace(PATTERNS.jsonPhone, '"phone": "[REDACTED_PHONE]"');
     
     // 13. Process/Thread IDs
     redactedText = redactedText.replace(PATTERNS.pid, '$1 [REDACTED_PID]');
@@ -259,7 +347,9 @@ function processText(text) {
             'User Data': {
                 usernames: counts.usernames,
                 names: counts.names,
-                addresses: counts.addresses
+                addresses: counts.addresses,
+                cities: counts.cities,
+                states: counts.states
             },
             Time: {
                 timestamps: counts.timestamps
@@ -368,9 +458,8 @@ async function analyzeSingleError(errorText) {
         const promptText = `Analyze this single error log and provide:
 1. Severity Level (Critical/High/Medium/Low)
 2. Detailed Root Cause
-3. Possible Solutions
+3. Possible Solutions may be coding fixes, configuration changes, or infrastructure adjustments.
 4. Prevention Tips
-
 Error Log:
 ${errorText}
 
@@ -464,7 +553,7 @@ app.post('/api/redact', upload.single('file'), (req, res) => {
             totalRedactions: result.counts.TOTAL
         });
         
-        // Extract error logs from redacted text
+        // Extract error logs from redacted text (returns array)
         const errorLogs = extractErrorLogs(result.redacted);
         console.log(errorLogs);
         
@@ -474,7 +563,7 @@ app.post('/api/redact', upload.single('file'), (req, res) => {
             original: result.original,
             redacted: result.redacted,
             hasErrors: errorLogs.length > 0,
-            errorCount: errorLogs.split('\n').filter(l => l.trim()).length
+            errorCount: errorLogs.length
         });
         
     } catch (error) {
@@ -533,19 +622,67 @@ app.post('/api/analyze-errors', async (req, res) => {
         
         console.log(`[INFO] Analyzing ${errorLogsArray.length} error(s) with AI...`);
         
-        // Analyze each error separately
+        // Track error occurrences and their positions
+        const errorHashMap = new Map(); // hash -> {count, positions, errorLog}
+        const errorHashes = []; // Array of hashes in order
+        
+        // First pass: identify duplicates
+        errorLogsArray.forEach((errorLog, index) => {
+            const hash = generateHash(errorLog);
+            errorHashes.push(hash);
+            
+            if (!errorHashMap.has(hash)) {
+                errorHashMap.set(hash, {
+                    count: 1,
+                    positions: [index + 1],
+                    errorLog: errorLog
+                });
+            } else {
+                const existing = errorHashMap.get(hash);
+                existing.count++;
+                existing.positions.push(index + 1);
+            }
+        });
+        
+        // Identify unique errors and repeated errors
+        const uniqueErrors = Array.from(errorHashMap.values()).filter(e => e.count === 1);
+        const repeatedErrors = Array.from(errorHashMap.values()).filter(e => e.count > 1);
+        
+        console.log(`[INFO] Found ${uniqueErrors.length} unique error(s) and ${repeatedErrors.length} repeated error type(s)`);
+        
+        // Analyze each unique error (cached results will be reused for duplicates)
         const analyses = [];
+        const analyzedHashes = new Map(); // Store analysis by hash to avoid re-analyzing
+        
         for (let i = 0; i < errorLogsArray.length; i++) {
             const errorLog = errorLogsArray[i];
-            console.log(`[INFO] Analyzing error ${i + 1}/${errorLogsArray.length}`);
+            const hash = errorHashes[i];
+            const errorInfo = errorHashMap.get(hash);
+            const isRepeated = errorInfo.count > 1;
+            
+            console.log(`[INFO] Analyzing error ${i + 1}/${errorLogsArray.length}${isRepeated ? ' (repeated)' : ''}`);
             
             try {
-                const analysis = await analyzeSingleError(errorLog);
+                let analysis;
+                
+                // Check if we've already analyzed this exact error
+                if (analyzedHashes.has(hash)) {
+                    analysis = { ...analyzedHashes.get(hash), cached: true };
+                    console.log(`[INFO] Using previously analyzed result for duplicate error`);
+                } else {
+                    analysis = await analyzeSingleError(errorLog);
+                    analyzedHashes.set(hash, analysis);
+                }
+                
                 if (analysis) {
                     analyses.push({
                         errorNumber: i + 1,
                         errorLog: errorLog,
-                        analysis: analysis
+                        analysis: analysis,
+                        isRepeated: isRepeated,
+                        repeatCount: errorInfo.count,
+                        repeatPositions: errorInfo.positions,
+                        isFirstOccurrence: errorInfo.positions[0] === i + 1
                     });
                 }
             } catch (error) {
@@ -559,7 +696,11 @@ app.post('/api/analyze-errors', async (req, res) => {
                         solutions: ['Retry analysis', 'Check error log format'],
                         prevention: 'Ensure proper logging format',
                         error: error.message
-                    }
+                    },
+                    isRepeated: isRepeated,
+                    repeatCount: errorInfo.count,
+                    repeatPositions: errorInfo.positions,
+                    isFirstOccurrence: errorInfo.positions[0] === i + 1
                 });
             }
         }
@@ -568,6 +709,8 @@ app.post('/api/analyze-errors', async (req, res) => {
             success: true,
             hasErrors: true,
             totalErrors: errorLogsArray.length,
+            uniqueErrorCount: errorHashMap.size,
+            repeatedErrorCount: repeatedErrors.length,
             analyses: analyses
         });
         
